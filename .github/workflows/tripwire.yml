@@ -1,0 +1,18 @@
+name: tripwire
+
+# Two cheap structural checks over the source tree: every tracked .lean file is
+# reachable from a default Lake target, and `sorry` appears only in the
+# comparator library.  No Lean toolchain and no Mathlib, so this finishes in
+# seconds and gives a fast signal ahead of any real build.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tripwire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import closure and sorry check
+        run: python3 tools/ci/check_import_closure.py
