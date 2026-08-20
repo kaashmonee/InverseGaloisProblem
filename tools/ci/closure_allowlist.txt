@@ -1,0 +1,24 @@
+# Tracked .lean files excused from the import-closure check.
+#
+# One path prefix (write it with a trailing "/") or one exact path per line.
+# Every entry carries its reason: an excused file is a file nothing builds, so
+# the reason is all that separates "parked on purpose" from "quietly rotting".
+
+# README: "preserved exploratory modules that are not part of the supported
+# import graph" -- kept for reference, deliberately outside every Lake target.
+InverseGalois/Experimental/
+
+# lakefile.toml, lean_lib Mathieu: "its twelve-point coset action needs a kernel
+# search over all of SL(2, ZMod 11) that costs more memory than the build
+# machine has, and nothing in this repository uses it."
+Mathieu/M11CosetAction.lean
+
+# TODO(author): duplicates InverseGalois/Rigidity/RET/Descent/BaseTransfer.lean
+# -- both files declare `namespace IsRegularGaloisGroupOverBase` /
+# `theorem of_algEquiv`. Only the Descent/ copy is wired into the
+# arithmetic-descent chain (Descent.lean -> StableDescent -> ConstantRealization
+# -> RegularBase -> BaseTransfer). Importing this top-level copy as written
+# would very likely collide with that already-in-closure declaration at
+# elaboration time -- deciding whether to delete it, rename its namespace, or
+# merge the two needs a human call, not a blind import.
+InverseGalois/Rigidity/RET/BaseTransfer.lean
