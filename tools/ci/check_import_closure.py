@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CI tripwire for this repository: import-closure and `sorry` checks.
+"""CI tripwire for this repository: import-closure and `sorry`/`admit` checks.
 
 Both checks use only the Python 3 standard library, are deterministic, and are
 cheap enough to run on every push without a Lean toolchain or a Mathlib download.
@@ -14,8 +14,12 @@ closure
 
 sorry
     No tracked ``.lean`` file outside a non-default library's source directory
-    may contain ``sorry``.  The comparator library under ``extras/comparator``
-    is the one place where an unproved statement is the point.
+    may contain ``sorry`` or ``admit``; both close a goal with an unchecked
+    obligation, so a proof holding either one is not a proof.  Only code counts:
+    ``admit`` is also an ordinary English word, and a doc comment saying two
+    coefficients "admit a Bezout identity" is not a hole.  The comparator
+    library under ``extras/comparator`` is the one place where an unproved
+    statement is the point.
 
 Exit status is 0 when every requested check passes and 1 otherwise.
 """
@@ -52,7 +56,15 @@ IMPORT_RE = re.compile(
 # somewhere else in the tree.
 IMPORT_KEYWORD_RE = re.compile(r"^\s*" + _MODIFIERS + r"import\b")
 
-SORRY_RE = re.compile(r"\bsorry\b")
+# `sorry` and the `admit` tactic leave the same unchecked proof obligation
+# behind, so the check makes no distinction between them.  Both are searched for
+# in the code visible outside comments only -- see `check_sorry`.
+SORRY_OR_ADMIT_RE = re.compile(r"\b(?:sorry|admit)\b")
+
+# Lean's `prelude` command, which a file that opts out of the automatic `Init`
+# import puts above its imports.  It is not a declaration, so the import header
+# continues past it.
+PRELUDE_RE = re.compile(r"^\s*prelude\s*$")
 
 # Byte-order mark, in case a file was written by an editor that emits one.
 BOM = "﻿"
@@ -204,8 +216,23 @@ class LeanLib:
         return "LeanLib(%r, srcDir=%r)" % (self.name, self.src_dir)
 
 
+def _decode_component(component):
+    """Undo Lean's ``«...»`` escape around one module-name component.
+
+    A component that is a keyword or that contains a space is written
+    ``«like this»`` in an ``import``, but the file on disk is named by the
+    decoded text: ``import «Odd Name»`` is ``Odd Name.lean``.  Splitting the
+    module name on ``.`` before decoding means a literal dot *inside*
+    guillemets (in Lean, ``«A.B»`` is a single component) is not handled -- a
+    deliberate limit, since full Lean-name semantics buy nothing here.
+    """
+    if len(component) >= 2 and component[0] == "«" and component[-1] == "»":
+        return component[1:-1]
+    return component
+
+
 def module_to_path(module, src_dir):
-    rel = module.replace(".", "/") + ".lean"
+    rel = "/".join(_decode_component(c) for c in module.split(".")) + ".lean"
     if src_dir in (".", ""):
         return rel
     return posixpath.normpath(posixpath.join(src_dir, rel))
@@ -219,16 +246,19 @@ def _path_to_module(path, src_dir):
 
 
 def expand_roots(lib, tracked):
-    """Root modules of a library, expanding Lake's glob suffixes.
+    """Root modules of a library: its ``roots``, plus what its ``globs`` select.
 
     ``Foo`` is the single module ``Foo``; ``Foo.*`` is every module strictly
     below ``Foo``; ``Foo.+`` is ``Foo`` together with everything below it.
+
+    ``roots`` and ``globs`` are independent module selectors, so a library that
+    declares both is the union of the two.  Taking only the roots would drop
+    every module a glob selects, and a module dropped here is a file the walk
+    never starts from -- which surfaces as a bogus orphan report.
     """
-    if lib.roots:
-        return list(lib.roots)
-    if not lib.globs:
+    if not lib.roots and not lib.globs:
         return [lib.name] if lib.name else []
-    modules = []
+    modules = list(lib.roots)
     for glob in lib.globs:
         if glob.endswith(".*") or glob.endswith(".+"):
             base = glob[:-2]
@@ -300,6 +330,10 @@ def strip_comments(line, depth):
 def header_imports(text, problems=None):
     """Modules imported by a Lean file, read from its header only.
 
+    A leading ``prelude`` is stepped over rather than ended on: it is a command,
+    not a declaration, and the imports it precedes are the whole point of the
+    header.
+
     ``problems``, when given, collects ``(lineno, text)`` for any line that
     begins with ``import`` yet does not parse as one.  Those are reported as a
     failure rather than passed over, because an unread import is a missing
@@ -313,6 +347,8 @@ def header_imports(text, problems=None):
         visible, depth = strip_comments(raw, depth)
         if not visible.strip():
             continue
+        if PRELUDE_RE.match(visible):
+            continue  # `prelude` stands above the imports; the header goes on
         m = IMPORT_RE.match(visible)
         if m:
             modules.append(m.group(1))
@@ -468,6 +504,13 @@ def check_closure(repo_root, tracked, default_libs, other_srcdirs, allowlist, ou
 
 
 def check_sorry(tracked, repo_root, exempt, out):
+    """Report every `sorry` or `admit` in code outside the exempt directories.
+
+    Comments are stripped first.  `admit` is an ordinary English word as well as
+    a tactic, and the prose in this tree does use it ("`r + 1` points admit
+    exactly the groups generated by `r` elements"); a word in a comment closes
+    no goal.
+    """
     hits = []
     scanned = 0
     exempted = 0
@@ -480,23 +523,27 @@ def check_sorry(tracked, repo_root, exempt, out):
             text = (repo_root / rel).read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if SORRY_RE.search(line):
-                hits.append((rel, lineno, line.strip()))
+        depth = 0
+        for lineno, raw in enumerate(text.splitlines(), start=1):
+            if lineno == 1:
+                raw = raw.lstrip(BOM)
+            visible, depth = strip_comments(raw, depth)
+            if SORRY_OR_ADMIT_RE.search(visible):
+                hits.append((rel, lineno, raw.strip()))
 
     where = ", ".join(d.rstrip("/") + "/" for d in exempt) or "(nothing)"
     if hits:
         print(
-            "sorry: FAIL -- `sorry` appears in %d tracked .lean file(s) outside %s"
-            % (len(set(h[0] for h in hits)), where),
+            "sorry: FAIL -- `sorry` or `admit` appears in %d tracked .lean "
+            "file(s) outside %s" % (len(set(h[0] for h in hits)), where),
             file=out,
         )
         for rel, lineno, line in hits:
             print("%s:%d: %s" % (rel, lineno, line), file=out)
         return False
     print(
-        "sorry: OK -- no `sorry` in %d tracked .lean file(s); %d exempt under %s"
-        % (scanned, exempted, where),
+        "sorry: OK -- no `sorry` or `admit` in %d tracked .lean file(s); "
+        "%d exempt under %s" % (scanned, exempted, where),
         file=out,
     )
     return True
