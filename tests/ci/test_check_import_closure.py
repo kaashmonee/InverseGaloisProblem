@@ -218,6 +218,188 @@ def test_checks_can_run_one_at_a_time(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Reading the import header
+#
+# Every case here is a way the header parser could quietly read *fewer* imports
+# than a file really has.  That is the dangerous direction: a dropped edge does
+# not fail loudly, it invents an orphan somewhere else in the tree.
+# --------------------------------------------------------------------------- #
+
+
+def test_guillemet_module_name_is_read(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {
+            "Main.lean": "import Mathlib\nimport «Odd Name»\nimport Main.Helper\n",
+            "Main/Deep.lean": "import Mathlib\n",
+            "Main/Helper.lean": "import Mathlib\nimport Main.Deep\n",
+        },
+    )
+    code, out = run_checks(repo)
+    assert code == 0, out
+
+
+def test_byte_order_mark_does_not_hide_the_header(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {
+            "Main.lean": "\ufeffimport Mathlib\nimport Main.Helper\n",
+            "Main/Helper.lean": "import Mathlib\n",
+        },
+    )
+    code, out = run_checks(repo)
+    assert code == 0, out
+
+
+def test_import_sharing_a_line_with_the_end_of_a_comment_block(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {"Main.lean": "/-\nCopyright (c) 2025.\n-/ import Main.Helper\n"},
+    )
+    code, out = run_checks(repo)
+    assert code == 0, out
+
+
+def test_crlf_header_is_read(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {
+            "Main.lean": "import Mathlib\r\nimport Main.Helper\r\n\r\n/-! # Entry -/\r\n",
+            "Main/Helper.lean": "import Mathlib\r\n",
+        },
+    )
+    code, out = run_checks(repo)
+    assert code == 0, out
+
+
+def test_unreadable_import_line_fails_instead_of_being_swallowed(tmp_path):
+    # `«` with no closing `»` is not a module name.  The old parser treated such
+    # a line as the first declaration and dropped every import after it.
+    repo = make_repo(
+        tmp_path,
+        {"Main.lean": "import Mathlib\nimport «unclosed\nimport Main.Helper\n"},
+    )
+    code, out = run_checks(repo)
+    assert code == 1
+    assert "could not be parsed" in out
+    assert "Main.lean:2:" in out
+
+
+# --------------------------------------------------------------------------- #
+# Target shapes: dotted roots, globs, a module beside a directory of the same name
+# --------------------------------------------------------------------------- #
+
+
+NESTED_LAKEFILE = """\
+defaultTargets = ["Main", "Nested"]
+
+[[lean_lib]]
+name = "Main"
+roots = ["Main"]
+
+[[lean_lib]]
+name = "Nested"
+roots = ["Main.Deep.One", "Main.Deep.Two"]
+
+[[lean_lib]]
+name = "Extra"
+srcDir = "extras/side"
+"""
+
+
+def test_dotted_roots_resolve_to_nested_paths(tmp_path):
+    """The `MathieuRigidity` shape: a target whose roots are dotted module names."""
+    repo = make_repo(
+        tmp_path,
+        {
+            "Main/Deep/One.lean": "import Mathlib\nimport Main.Deep.Shared\n",
+            "Main/Deep/Two.lean": "import Mathlib\n",
+            "Main/Deep/Shared.lean": "import Mathlib\n",
+        },
+        lakefile=NESTED_LAKEFILE,
+    )
+    code, out = run_checks(repo)
+    assert code == 0, out
+    assert "closure: OK" in out
+
+
+def test_a_dotted_root_that_names_no_file_is_reported(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {"Main/Deep/One.lean": "import Mathlib\n"},
+        lakefile=NESTED_LAKEFILE,
+    )
+    code, out = run_checks(repo)
+    assert code == 1
+    assert "Main/Deep/Two.lean  (root Main.Deep.Two of lean_lib Nested)" in out
+
+
+def _glob_lakefile(glob):
+    return (
+        'defaultTargets = ["Main"]\n\n[[lean_lib]]\nname = "Main"\n'
+        'globs = ["%s"]\n\n[[lean_lib]]\nname = "Extra"\nsrcDir = "extras/side"\n' % glob
+    )
+
+
+def test_plus_glob_covers_the_root_module_and_everything_below(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {"Main/Stray.lean": "import Mathlib\n"},
+        lakefile=_glob_lakefile("Main.+"),
+    )
+    code, out = run_checks(repo)
+    assert code == 0, out
+
+
+def test_star_glob_excludes_the_root_module_itself(tmp_path):
+    # `Main.*` is everything strictly below `Main`, so `Main.lean` is built by
+    # nothing and must be reported.
+    repo = make_repo(tmp_path, lakefile=_glob_lakefile("Main.*"))
+    code, out = run_checks(repo)
+    assert code == 1
+    assert reported_paths(out) == ["Main.lean"]
+
+
+def test_module_beside_a_directory_of_the_same_name_is_judged_separately(tmp_path):
+    """`Main/Poly.lean` and `Main/Poly/*.lean` are different modules.
+
+    This is the shape of the real `InverseGalois/Polynomial.lean` finding: the
+    umbrella module is dead while every leaf under the directory is alive.
+    """
+    repo = make_repo(
+        tmp_path,
+        {
+            "Main/Helper.lean": "import Mathlib\nimport Main.Poly.Sub\n",
+            "Main/Poly.lean": "import Mathlib\nimport Main.Poly.Sub\n",
+            "Main/Poly/Sub.lean": "import Mathlib\n",
+        },
+    )
+    code, out = run_checks(repo)
+    assert code == 1
+    assert reported_paths(out) == ["Main/Poly.lean"]
+
+
+def test_allowlist_keeps_a_leading_dot_in_a_directory_name(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {".vendor/Stray.lean": "import Mathlib\n"},
+        allowlist="# reason: vendored\n.vendor/\n",
+    )
+    code, out = run_checks(repo)
+    assert code == 0, out
+
+
+def test_allowlist_entry_may_be_written_with_a_leading_dot_slash(tmp_path):
+    repo = make_repo(
+        tmp_path,
+        {"Main/Stray.lean": "import Mathlib\n"},
+        allowlist="# reason: parked\n./Main/Stray.lean\n",
+    )
+    code, out = run_checks(repo)
+    assert code == 0, out
+
+
+# --------------------------------------------------------------------------- #
 # lakefile parsing, against the real file
 # --------------------------------------------------------------------------- #
 

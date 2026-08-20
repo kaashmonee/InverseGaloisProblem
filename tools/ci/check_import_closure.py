@@ -36,11 +36,26 @@ DEFAULT_ALLOWLIST = "tools/ci/closure_allowlist.txt"
 
 # Lean import lines.  Tolerant of the modifiers newer Lean versions allow
 # (`public import`, `import all`) while keeping the plain `import Foo.Bar` core.
+# A module name is a dot-separated list of components, each either a bare
+# identifier or a «guillemet-quoted» one -- Lean's escape for names that are
+# keywords or that contain spaces.
+_MODIFIERS = r"(?:public\s+|private\s+|meta\s+)*"
+_COMPONENT = r"(?:[\w'!?À-￿]+|«[^»\n]*»)"
 IMPORT_RE = re.compile(
-    r"^\s*(?:public\s+|private\s+|meta\s+)*import\s+(?:all\s+)?([\w.À-￿]+)"
+    r"^\s*" + _MODIFIERS + r"import\s+(?:all\s+)?"
+    r"(" + _COMPONENT + r"(?:\." + _COMPONENT + r")*)"
 )
 
+# A line that is unmistakably an import but that IMPORT_RE could not read.  It
+# must never be swallowed silently: an import the walk cannot see is an edge
+# missing from the graph, and a missing edge becomes a bogus orphan report
+# somewhere else in the tree.
+IMPORT_KEYWORD_RE = re.compile(r"^\s*" + _MODIFIERS + r"import\b")
+
 SORRY_RE = re.compile(r"\bsorry\b")
+
+# Byte-order mark, in case a file was written by an editor that emits one.
+BOM = "﻿"
 
 
 # --------------------------------------------------------------------------- #
@@ -249,23 +264,62 @@ def tracked_lean_files(repo_root):
     return sorted(p for p in proc.stdout.split("\0") if p)
 
 
-def header_imports(text):
-    """Modules imported by a Lean file, read from its header only."""
+def strip_comments(line, depth):
+    """Blank out the commented spans of ``line``; track block-comment nesting.
+
+    Returns the code visible outside comments together with the new nesting
+    depth.  Scanning character by character rather than counting ``/-`` and
+    ``-/`` per line keeps an import that shares a line with the end of a
+    copyright block (``-/ import Foo``) from being dropped.
+    """
+    out = []
+    i, n = 0, len(line)
+    while i < n:
+        pair = line[i:i + 2]
+        if depth:
+            if pair == "-/":
+                depth -= 1
+                i += 2
+            elif pair == "/-":
+                depth += 1
+                i += 2
+            else:
+                i += 1
+            continue
+        if pair == "/-":
+            depth += 1
+            i += 2
+            continue
+        if pair == "--":
+            break  # line comment: the rest of the line is not code
+        out.append(line[i])
+        i += 1
+    return "".join(out), depth
+
+
+def header_imports(text, problems=None):
+    """Modules imported by a Lean file, read from its header only.
+
+    ``problems``, when given, collects ``(lineno, text)`` for any line that
+    begins with ``import`` yet does not parse as one.  Those are reported as a
+    failure rather than passed over, because an unread import is a missing
+    edge.
+    """
     modules = []
     depth = 0
-    for line in text.splitlines():
-        if depth:
-            depth = max(depth + line.count("/-") - line.count("-/"), 0)
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        if lineno == 1:
+            raw = raw.lstrip(BOM)
+        visible, depth = strip_comments(raw, depth)
+        if not visible.strip():
             continue
-        stripped = line.strip()
-        if not stripped or stripped.startswith("--"):
-            continue
-        if stripped.startswith("/-"):
-            depth = max(line.count("/-") - line.count("-/"), 0)
-            continue
-        m = IMPORT_RE.match(line)
+        m = IMPORT_RE.match(visible)
         if m:
             modules.append(m.group(1))
+            continue
+        if IMPORT_KEYWORD_RE.match(visible):
+            if problems is not None:
+                problems.append((lineno, visible.strip()))
             continue
         break  # first real declaration: the import header is over
     return modules
@@ -274,11 +328,13 @@ def header_imports(text):
 def compute_closure(libs, tracked, repo_root):
     """Walk the import graph out from the roots of ``libs``.
 
-    Returns the reachable file set and any root module that resolves to no
-    tracked file (a broken target, reported as a failure).
+    Returns the reachable file set, any root module that resolves to no tracked
+    file (a broken target), and any line that looks like an import but could not
+    be read.  Both are reported as failures.
     """
     closure = set()
     missing_roots = []
+    unreadable = []
     queue = []
 
     for lib in libs:
@@ -294,10 +350,11 @@ def compute_closure(libs, tracked, repo_root):
     while queue:
         path, src_dir = queue.pop()
         try:
-            text = (repo_root / path).read_text(encoding="utf-8", errors="replace")
+            text = (repo_root / path).read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
-        for module in header_imports(text):
+        problems = []
+        for module in header_imports(text, problems):
             for candidate_dir in (src_dir, "."):
                 candidate = module_to_path(module, candidate_dir)
                 if candidate in tracked:
@@ -307,17 +364,21 @@ def compute_closure(libs, tracked, repo_root):
                     break
             # An import that resolves to no tracked file is external
             # (Mathlib, Batteries, Std, ...) and is ignored.
-    return closure, missing_roots
+        for lineno, line in problems:
+            unreadable.append((path, lineno, line))
+    return closure, missing_roots, unreadable
 
 
 def load_allowlist(path):
     if not path.is_file():
         return []
     entries = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw.split("#", 1)[0].strip()
+        if line.startswith("./"):
+            line = line[2:]
         if line:
-            entries.append(line.lstrip("./"))
+            entries.append(line)
     return entries
 
 
@@ -347,7 +408,9 @@ def under_any(rel, dirs):
 
 
 def check_closure(repo_root, tracked, default_libs, other_srcdirs, allowlist, out):
-    closure, missing_roots = compute_closure(default_libs, set(tracked), repo_root)
+    closure, missing_roots, unreadable = compute_closure(
+        default_libs, set(tracked), repo_root
+    )
 
     orphans = []
     excused = 0
@@ -360,7 +423,16 @@ def check_closure(repo_root, tracked, default_libs, other_srcdirs, allowlist, ou
         orphans.append(rel)
 
     targets = ", ".join(lib.name for lib in default_libs)
-    ok = not orphans and not missing_roots
+    ok = not orphans and not missing_roots and not unreadable
+
+    if unreadable:
+        print(
+            "closure: FAIL -- %d line(s) begin with `import` but could not be "
+            "parsed, so the graph is incomplete" % len(unreadable),
+            file=out,
+        )
+        for path, lineno, line in unreadable:
+            print("%s:%d: %s" % (path, lineno, line), file=out)
 
     if missing_roots:
         print(
@@ -405,7 +477,7 @@ def check_sorry(tracked, repo_root, exempt, out):
             continue
         scanned += 1
         try:
-            text = (repo_root / rel).read_text(encoding="utf-8", errors="replace")
+            text = (repo_root / rel).read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
@@ -441,7 +513,7 @@ def run(repo_root, do_closure, do_sorry, allowlist_path, out):
         print("error: no lakefile.toml at %s" % lakefile, file=out)
         return 1
 
-    config = parse_toml_subset(lakefile.read_text(encoding="utf-8"))
+    config = parse_toml_subset(lakefile.read_text(encoding="utf-8-sig"))
     default_targets = [str(t) for t in config.get("defaultTargets", []) or []]
     libs = [LeanLib(t) for t in config.get("lean_lib", []) or []]
     default_libs = [lib for lib in libs if lib.name in default_targets]

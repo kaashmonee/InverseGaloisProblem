@@ -10,6 +10,14 @@ from them. Every tracked `.lean` file the walk never reaches is reported: nothin
 it, so nothing checks it, and it can rot while the tree still looks healthy. Imports
 that resolve to no tracked file are external (Mathlib, Batteries, ...) and are ignored.
 
+The header parser errs towards reading *more* imports, because a dropped edge does not
+fail loudly -- it invents an orphan somewhere else in the tree. It reads through
+copyright and doc-comment blocks (including an import on the same line as the closing
+`-/`), through a byte-order mark, and accepts `«guillemet-quoted»` module names and the
+`public` / `private` / `meta` / `all` modifiers. A line that begins with `import` but
+that it still cannot parse is a hard failure rather than a silent stop, since from that
+point on the file would look import-free.
+
 **sorry.** No tracked `.lean` file may contain `sorry` outside the source directory of a
 non-default library -- in practice `extras/comparator`, whose `Challenge` depends on one.
 
