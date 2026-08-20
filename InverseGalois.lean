@@ -1,4 +1,5 @@
 import InverseGalois.Core
+import InverseGalois.Polynomial
 import InverseGalois.Groups
 import InverseGalois.Hilbert
 import InverseGalois.NumberTheory

@@ -1,3 +1,4 @@
+import InverseGalois.Hilbert.Analytic
 import InverseGalois.Hilbert.GaloisAction
 import InverseGalois.Hilbert.RegularExtension
 import InverseGalois.Hilbert.Symmetric

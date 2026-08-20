@@ -12,3 +12,13 @@ InverseGalois/Experimental/
 # search over all of SL(2, ZMod 11) that costs more memory than the build
 # machine has, and nothing in this repository uses it."
 Mathieu/M11CosetAction.lean
+
+# TODO(author): duplicates InverseGalois/Rigidity/RET/Descent/BaseTransfer.lean
+# -- both files declare `namespace IsRegularGaloisGroupOverBase` /
+# `theorem of_algEquiv`. Only the Descent/ copy is wired into the
+# arithmetic-descent chain (Descent.lean -> StableDescent -> ConstantRealization
+# -> RegularBase -> BaseTransfer). Importing this top-level copy as written
+# would very likely collide with that already-in-closure declaration at
+# elaboration time -- deciding whether to delete it, rename its namespace, or
+# merge the two needs a human call, not a blind import.
+InverseGalois/Rigidity/RET/BaseTransfer.lean
